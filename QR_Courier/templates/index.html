@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Secure QR Scanner</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 1rem; background: #0b0b0c; color: #f4f4f5; }
+    header { margin-bottom: 1rem; }
+    .wrap { display: grid; gap: 1rem; }
+    video, canvas { width: 100%; max-width: 560px; border-radius: 12px; background: #111; }
+    .panel { padding: 1rem; background: #141417; border: 1px solid #26262b; border-radius: 12px; max-width: 560px; }
+    .btn { appearance: none; border: 1px solid #2f2f36; background: #1b1b21; color: #fff; padding: .6rem .9rem; border-radius: 10px; cursor: pointer; }
+    .btn:disabled { opacity: .6; cursor: not-allowed; }
+    table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
+    th, td { text-align: left; border-bottom: 1px solid #2a2a30; padding: .5rem .2rem; }
+    .good { color: #6ee7b7; }
+    .bad { color: #fda4af; }
+    .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items:center; }
+    footer { opacity: .7; margin-top: 1rem; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h2>Secure QR Scanner</h2>
+    <p>Point your camera at the encrypted QR. We’ll decrypt it on the server and show the data.</p>
+  </header>
+
+  <div class="wrap">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas" hidden></canvas>
+
+    <div class="panel">
+      <div class="row">
+        <button id="start" class="btn">Start camera</button>
+        <button id="stop" class="btn" disabled>Stop</button>
+        <button id="flip" class="btn" disabled>Flip camera</button>
+      </div>
+      <p id="status">Idle.</p>
+      <div id="result" hidden>
+        <h3 class="good">Decrypted data</h3>
+        <table id="data-table"></table>
+      </div>
+      <div id="error" class="bad" hidden></div>
+    </div>
+  </div>
+
+  <!-- jsQR (lightweight QR decoder) -->
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const startBtn = document.getElementById('start');
+    const stopBtn = document.getElementById('stop');
+    const flipBtn = document.getElementById('flip');
+    const statusEl = document.getElementById('status');
+    const errorEl = document.getElementById('error');
+    const resultWrap = document.getElementById('result');
+    const dataTable = document.getElementById('data-table');
+
+    let stream = null;
+    let rafId = null;
+    let facingMode = "environment"; // back camera if available
+    let lastDecoded = null;
+    let scanning = false;
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+    function showError(msg){ errorEl.textContent = msg; errorEl.hidden = false; }
+    function clearError(){ errorEl.hidden = true; errorEl.textContent = ""; }
+
+    async function startCamera() {
+      clearError();
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: facingMode } },
+          audio: false
+        });
+        video.srcObject = stream;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        flipBtn.disabled = false;
+        scanning = true;
+        setStatus("Camera started. Scanning...");
+        tick();
+      } catch(err) {
+        showError("Camera error: " + (err?.message || err));
+        setStatus("Unable to access camera.");
+      }
+    }
+
+    function stopCamera() {
+      if (rafId) cancelAnimationFrame(rafId);
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      stream = null;
+      scanning = false;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      setStatus("Camera stopped.");
+    }
+
+    function flipCamera() {
+      facingMode = (facingMode === "environment" ? "user" : "environment");
+      stopCamera();
+      startCamera();
+    }
+
+    async function sendToDecrypt(encoded) {
+      try {
+        const res = await fetch("/decrypt", {
+          method: "POST",
+          headers: { "Content-Type":"application/json" },
+          body: JSON.stringify({ encoded })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          showError(data.error || "Decryption failed");
+          return;
+        }
+        renderTable(data.data);
+      } catch (e) {
+        showError("Network/decrypt error");
+      }
+    }
+
+    function renderTable(obj) {
+      resultWrap.hidden = false;
+      dataTable.innerHTML = "";
+      // Display as a simple two-column table
+      Object.keys(obj).forEach(k => {
+        const tr = document.createElement('tr');
+        const th = document.createElement('th'); th.textContent = k;
+        const td = document.createElement('td'); td.textContent = obj[k];
+        tr.appendChild(th); tr.appendChild(td);
+        dataTable.appendChild(tr);
+      });
+      setStatus("Decrypted successfully.");
+    }
+
+    function tick() {
+      if (!scanning) return;
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      if (!w || !h) { rafId = requestAnimationFrame(tick); return; }
+
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0, w, h);
+      const imgData = ctx.getImageData(0, 0, w, h);
+
+      const code = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: "dontInvert" });
+      if (code && code.data && code.data !== lastDecoded) {
+        lastDecoded = code.data;
+        setStatus("QR detected. Decrypting...");
+        sendToDecrypt(code.data);
+      }
+      rafId = requestAnimationFrame(tick);
+    }
+
+    startBtn.addEventListener('click', startCamera);
+    stopBtn.addEventListener('click', stopCamera);
+    flipBtn.addEventListener('click', flipCamera);
+
+    // Auto-start if permissions were previously granted
+    if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({name: 'camera'}).then(p => {
+        if (p.state === 'granted') startCamera();
+      }).catch(()=>{});
+    }
+  </script>
+
+  <footer>Tip: on iOS Safari you must interact (tap Start) to enable the camera.</footer>
+</body>
+</html>
